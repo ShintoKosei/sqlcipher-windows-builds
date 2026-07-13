@@ -1,0 +1,212 @@
+name: Build Windows SQLCipher
+
+on:
+  workflow_dispatch:
+    inputs:
+      sqlcipher_ref:
+        description: SQLCipher tag, branch, commit, or latest
+        required: true
+        default: latest
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  REQUESTED_SQLCIPHER_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.sqlcipher_ref || 'latest' }}
+
+jobs:
+  build:
+    name: Build Windows x64 UCRT
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            make
+            perl
+            tcl
+            zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Resolve SQLCipher ref
+        run: |
+          set -euo pipefail
+
+          requested_ref="${REQUESTED_SQLCIPHER_REF:-latest}"
+          if [ "$requested_ref" = "latest" ]; then
+            resolved_ref="$(
+              git ls-remote --tags --refs https://github.com/sqlcipher/sqlcipher.git 'v*' |
+              awk -F/ '{print $NF}' |
+              sort -V |
+              tail -n 1
+            )"
+          else
+            resolved_ref="$requested_ref"
+          fi
+
+          if [ -z "$resolved_ref" ]; then
+            echo "Could not resolve SQLCipher ref." >&2
+            exit 1
+          fi
+
+          safe_ref="$(printf '%s' "$resolved_ref" | tr '/:@ ' '----')"
+          {
+            echo "SQLCIPHER_REF=$resolved_ref"
+            echo "SQLCIPHER_REF_SAFE=$safe_ref"
+          } >> "$GITHUB_ENV"
+
+          echo "SQLCipher ref: $resolved_ref"
+
+      - name: Clone SQLCipher
+        run: |
+          set -euo pipefail
+
+          if ! git clone --depth 1 --branch "$SQLCIPHER_REF" https://github.com/sqlcipher/sqlcipher.git source; then
+            git clone https://github.com/sqlcipher/sqlcipher.git source
+            git -C source checkout "$SQLCIPHER_REF"
+          fi
+
+      - name: Apply MinGW GCC workaround
+        run: |
+          set -euo pipefail
+
+          if grep -Fq 'uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);' source/src/sqlcipher.c; then
+            perl -0pi -e 's/  uint64_t z = \(\*x \+= 0x9e3779b97f4a7c15ULL\);/#if defined(__MINGW32__) \&\& defined(__GNUC__)\n  volatile uint64_t increment = 0x9e3779b97f4a7c15ULL;\n  uint64_t z = (*x += increment);\n#else\n  uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);\n#endif/' source/src/sqlcipher.c
+            grep -Fq 'volatile uint64_t increment = 0x9e3779b97f4a7c15ULL;' source/src/sqlcipher.c
+            echo "SQLCIPHER_PATCHES=mingw-splitmix64-immediate-workaround" >> "$GITHUB_ENV"
+          else
+            echo "SQLCIPHER_PATCHES=none" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure and build
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          ./configure \
+            --with-tempstore=yes \
+            CFLAGS="-O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown" \
+            LDFLAGS="-lcrypto"
+
+          make -j"$(nproc)"
+
+      - name: Package CLI and runtime DLLs
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          built_cli=""
+          for candidate in source/sqlcipher.exe source/sqlite3.exe; do
+            if [ -f "$candidate" ]; then
+              built_cli="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$built_cli" ]; then
+            built_cli="$(
+              find source -maxdepth 3 -type f \( -iname 'sqlcipher.exe' -o -iname 'sqlite3.exe' \) -print -quit
+            )"
+          fi
+
+          if [ -z "$built_cli" ]; then
+            echo "Could not find the built SQLCipher CLI executable." >&2
+            find source -maxdepth 3 -type f \( -iname '*sqlcipher*' -o -iname 'sqlite3.exe' \) -print >&2
+            exit 1
+          fi
+
+          cp "$built_cli" dist/sqlcipher.exe
+
+          ldd dist/sqlcipher.exe |
+            awk '/\/ucrt64\// {print $3}' |
+            sort -u |
+            while read -r dll_path; do
+              if [ -f "$dll_path" ]; then
+                cp -n "$dll_path" dist/
+              fi
+            done
+
+          for license_file in LICENSE.md LICENSE.txt SQLITE_LICENSE.md; do
+            if [ -f "source/$license_file" ]; then
+              cp "source/$license_file" "dist/SQLCIPHER_$license_file"
+            fi
+          done
+
+          sqlcipher_version="$(./dist/sqlcipher.exe -version | tr -d '\r')"
+          cipher_version="$(./dist/sqlcipher.exe ':memory:' 'PRAGMA cipher_version;' | tr -d '\r')"
+
+          if [ -z "$cipher_version" ]; then
+            echo "PRAGMA cipher_version returned no output; SQLCipher support may be disabled." >&2
+            exit 1
+          fi
+
+          cat > dist/BUILD_INFO.txt <<EOF
+          SQLCipher ref: $SQLCIPHER_REF
+          Build patches: $SQLCIPHER_PATCHES
+          Source executable: $built_cli
+          Packaged executable: sqlcipher.exe
+          SQLCipher CLI version: $sqlcipher_version
+          SQLCipher pragma cipher_version: $cipher_version
+          Target: Windows x64 UCRT
+          Built from: https://github.com/sqlcipher/sqlcipher
+          EOF
+
+          artifact_name="sqlcipher-${SQLCIPHER_REF_SAFE}-windows-x64-ucrt.zip"
+          (cd dist && zip -9 -r "../$artifact_name" .)
+
+          {
+            echo "ARTIFACT_NAME=$artifact_name"
+            echo "SQLCIPHER_CLI_VERSION=$sqlcipher_version"
+            echo "SQLCIPHER_PRAGMA_VERSION=$cipher_version"
+          } >> "$GITHUB_ENV"
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Windows x64 UCRT SQLCipher CLI build.
+
+          - SQLCipher ref: \`$SQLCIPHER_REF\`
+          - Build patches: \`$SQLCIPHER_PATCHES\`
+          - CLI version: \`$SQLCIPHER_CLI_VERSION\`
+          - PRAGMA cipher_version: \`$SQLCIPHER_PRAGMA_VERSION\`
+          - Upstream: https://github.com/sqlcipher/sqlcipher
+
+          Archive contents include \`sqlcipher.exe\`, runtime DLLs, build metadata, and upstream license files.
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sqlcipher-${{ env.SQLCIPHER_REF_SAFE }}-windows-x64-ucrt
+          name: SQLCipher ${{ env.SQLCIPHER_REF }} Windows x64 UCRT
+          body_path: release-notes.md
+          files: ${{ env.ARTIFACT_NAME }}
+          make_latest: true
+          overwrite_files: true
