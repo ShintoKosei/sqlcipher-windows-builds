@@ -4,14 +4,23 @@ on:
   workflow_dispatch:
     inputs:
       sqlcipher_ref:
-        description: SQLCipher tag, branch, commit, or latest
+        description: SQLCipher tag, branch, commit, or latest (latest stable release)
         required: true
         default: latest
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-windows.yml
   schedule:
     - cron: "17 3 * * 1"
 
 permissions:
   contents: write
+
+concurrency:
+  group: sqlcipher-windows-build
+  cancel-in-progress: false
 
 env:
   REQUESTED_SQLCIPHER_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.sqlcipher_ref || 'latest' }}
@@ -27,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout build scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2 UCRT64
         uses: msys2/setup-msys2@v2
@@ -51,9 +60,12 @@ jobs:
 
           requested_ref="${REQUESTED_SQLCIPHER_REF:-latest}"
           if [ "$requested_ref" = "latest" ]; then
+            # Keep only stable vX.Y.Z tags. Pre-release tags such as
+            # v5.0.0-beta.1 sort after stable tags with sort -V.
             resolved_ref="$(
               git ls-remote --tags --refs https://github.com/sqlcipher/sqlcipher.git 'v*' |
               awk -F/ '{print $NF}' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
               sort -V |
               tail -n 1
             )"
@@ -62,7 +74,7 @@ jobs:
           fi
 
           if [ -z "$resolved_ref" ]; then
-            echo "Could not resolve SQLCipher ref." >&2
+            echo "Could not resolve a stable SQLCipher ref." >&2
             exit 1
           fi
 
@@ -70,11 +82,29 @@ jobs:
           {
             echo "SQLCIPHER_REF=$resolved_ref"
             echo "SQLCIPHER_REF_SAFE=$safe_ref"
+            echo "RELEASE_TAG=sqlcipher-$safe_ref-windows-x64-ucrt"
           } >> "$GITHUB_ENV"
 
-          echo "SQLCipher ref: $resolved_ref"
+          echo "Resolved SQLCipher ref: $resolved_ref"
+          echo "Release tag: sqlcipher-$safe_ref-windows-x64-ucrt"
+
+      - name: Skip unchanged release
+        id: check_release
+        if: github.event_name == 'schedule'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists, skipping rebuild."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $RELEASE_TAG not found, building it."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Clone SQLCipher
+        if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -84,6 +114,7 @@ jobs:
           fi
 
       - name: Apply MinGW GCC workaround
+        if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -96,18 +127,33 @@ jobs:
           fi
 
       - name: Configure and build
+        if: steps.check_release.outputs.skip != 'true'
         working-directory: source
         run: |
           set -euo pipefail
 
+          # SQLCipher 5.x enforces SQLITE_USE_URI and
+          # SQLITE_DIRECT_OVERFLOW_READ=0 with #error checks in
+          # src/sqlcipher.c, and no longer uses SQLITE_HAS_CODEC.
+          # Detect the profile from the source so arbitrary refs work too.
+          if grep -Fq 'SQLCipher must be compiled with -DSQLITE_USE_URI' src/sqlcipher.c; then
+            cflags="-O2 -DSQLITE_USE_URI=1 -DSQLITE_DIRECT_OVERFLOW_READ=0 -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown"
+            echo "Build profile: SQLCipher 5.x"
+          else
+            cflags="-O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown"
+            echo "Build profile: SQLCipher 4.x"
+          fi
+          echo "CFLAGS: $cflags"
+
           ./configure \
             --with-tempstore=yes \
-            CFLAGS="-O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown" \
+            CFLAGS="$cflags" \
             LDFLAGS="-lcrypto"
 
           make -j"$(nproc)"
 
       - name: Package CLI and runtime DLLs
+        if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -179,6 +225,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Write release notes
+        if: steps.check_release.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
@@ -195,6 +242,7 @@ jobs:
           EOF
 
       - name: Upload artifact
+        if: steps.check_release.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -202,6 +250,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish release
+        if: steps.check_release.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: sqlcipher-${{ env.SQLCIPHER_REF_SAFE }}-windows-x64-ucrt
